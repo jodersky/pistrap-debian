@@ -22,13 +22,23 @@ Create a bootable image for a RaspberryPi 2 on DEVICE.
 
 Options:
   --force                           Don't ask for any confirmations.
+
   --mirror=<$MIRROR>                Use a debian mirror, such as "fr" or "ch"
+
   --hostname=<$HOSTNAME>            Use a given hostname for the device.
+
   --timezone=<$TIMEZONE>            Set timezone data as listed in /usr/share/zoneinfo
-  --wpa-essid=<$WPA_ESSID>          Use a given wireless ESSID. Sets up wireless networking.
+
+  --wpa-essid=<$WPA_ESSID>          Use a given wireless ESSID. Sets up wireless
+                                    networking.
+  
   --wpa-psk=<$WPA_PSK>              Use a given WPA pre-shared key.
+  
   --password=<$ROOT_PASWORD>        Set the given root password.
-  --ssh-key=<$SSH_KEY>              Add the given SSH key to root's authorized_keys file. If invalid, password login will be enabled.
+  
+  --ssh-key=<$SSH_KEY>              Add the given SSH key to root's authorized_keys file.
+                                    If invalid, password login will be enabled.
+  
   --root-fs=<$ROOTFS>               Use given directory as mount point during installation.
 ```
 
