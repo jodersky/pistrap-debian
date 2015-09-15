@@ -1,0 +1,236 @@
+#!/bin/bash
+set -e
+
+# Variables set through command-line arguments
+# the assigned values are used as defaults if no matching argument is provided
+FORCE=0
+MIRROR=""
+HOSTNAME="pi"
+TIMEZONE="UTC"
+WPA_ESSID=""
+WPA_PSK=""
+ROOT_PASSWORD="toor"
+SSH_KEY="$HOME/.ssh/id_rsa.pub"
+
+# Paths for installation
+DEVICE=/dev/nonexisting
+PARTITION1="$DEVICE"p1
+PARTITION2="$DEVICE"p2
+ROOTFS=/mnt/pi
+
+print_usage() {
+    cat 1>&2 <<EOF
+Usage: $0 [OPTION]... DEVICE
+Create a bootable image for a RaspberryPi 2 on DEVICE.
+
+Options:
+  --force				Don't ask for any confirmations.
+  --mirror=<$MIRROR>				Use a debian mirror, such as "fr" or "ch"
+  --hostname=<$HOSTNAME>			Use a given hostname for the device.
+  --timezone=<$TIMEZONE>			Set timezone data as listed in /usr/share/zoneinfo
+  --wpa-essid=<$WPA_ESSID>			Use a given wireless ESSID. Sets up wireless networking.
+  --wpa-psk=<$WPA_PSK>				Use a given WPA pre-shared key.
+  --password=<$ROOT_PASWORD>				Set the given root password.
+  --ssh-key=<$SSH_KEY>	Add the given SSH key to root's authorized_keys file. If invalid, password login will be enabled.
+  --root-fs=<$ROOTFS>			Use given directory as mount point during installation.
+EOF
+
+}
+
+
+# Process options
+while [ $# -gt 1 ]
+do
+    case "$1" in
+	-f|--force)
+	    FORCE=1
+	    ;;
+	--mirror=*)
+	    MIRROR=."${1#*=}"
+	    ;;
+	--hostname=*)
+	    HOSTNAME="${1#*=}"
+	    ;;
+	--timezone=*)
+	    TIMEZONE="${1#*=}"
+	    ;;
+	--wpa-essid=*)
+	    WPA_ESSID="${1#*=}"
+	    ;;
+	--wpa-psk=*)
+	    WPA_PSK="${1#*=}"
+	    ;;
+	--password=*)
+	    ROOT_PASSWORD="${1#*=}"
+	    ;;
+	--ssh-key=*)
+	    SSH_KEY="${1#*=}"
+	    ;;
+	--root-fs=*)
+	    ROOTFS="${1#*=}"
+	    ;;
+	*)
+	    echo "Unknown argument: $1" 1>&2
+	    exit 1
+    esac
+    shift
+done
+
+# Process last argument, the device to use
+if [ -z "$1" ] || [ "$1" = -h ] || [ "$1" = --help ]; then
+    print_usage
+    exit 1
+fi
+if [ ! -e "$1" ]; then
+    echo "Device not found: $1" 1>&2
+    exit 1
+fi
+if [ ! -b "$1" ]; then
+    echo "Specified device is not a block device: $1" 1>&2
+    exit 1
+fi
+DEVICE="$1"
+PARTITION1="$DEVICE"p1
+PARTITION2="$DEVICE"p2
+
+# Check environment
+if [ "$EUID" != 0 ]; then
+    echo "This script must be run as root." 1>&2
+    exit 1
+fi
+
+# Argument processing and enivronment check are done at this point
+# Start with actual script
+
+# Setup partitions on SD card
+partition() {
+    parted "$DEVICE" --script mklabel msdos &&
+    parted "$DEVICE" --script mkpart primary fat32 1M 200M &&
+    parted "$DEVICE" --script mkpart primary ext4 200M 100% &&
+    mkfs.vfat -F 32 "$PARTITION1" &&
+    mkfs.ext4 "$PARTITION2"
+}
+
+mountrootfs() {
+    mkdir "$ROOTFS" &&
+    mount "$PARTITION2" "$ROOTFS" &&
+    
+    mkdir "$ROOTFS"/boot &&
+    mount "$PARTITION1" "$ROOTFS"/boot
+}
+
+mkrootfs() {
+    # Create initial debian filesystem
+    qemu-debootstrap --arch=armhf \
+		     --include=ssh,sudo,ntpdate,fake-hwclock,openssl,ca-certificates,vim,nano,cryptsetup,lvm2,locales,less,cpufrequtils,wireless-tools,wpasupplicant \
+		     jessie \
+		     "$ROOTFS" \
+		     "http://ftp${MIRROR}.debian.org/debian/"
+
+    # Set package configuration to use raspberrypi.org archive for kernel package
+    cat > "$ROOTFS"/etc/apt/sources.list <<EOF
+deb http://ftp${MIRROR}.debian.org/debian jessie main contrib non-free
+deb http://ftp${MIRROR}.debian.org/debian jessie-updates main contrib non-free
+deb http://security.debian.org jessie/updates main contrib non-free
+deb http://archive.raspberrypi.org/debian wheezy main
+EOF
+
+    cat > "$ROOTFS"/etc/apt/preferences.d/raspberrypi <<EOF
+Package: *
+Pin: origin archive.raspberrypi.org
+Pin-Priority: 1
+
+Package: raspberrypi-bootloader
+Pin: origin archive.raspberrypi.org
+Pin-Priority: 1000
+
+Package: libraspberrypi0
+Pin: origin archive.raspberrypi.org
+Pin-Priority: 1000
+
+Package: libraspberrypi-bin
+Pin: origin archive.raspberrypi.org
+Pin-Priority: 1000
+EOF
+
+    chroot "$ROOTFS" /bin/sh -c "wget https://archive.raspberrypi.org/debian/raspberrypi.gpg.key -O - | apt-key add -"
+    
+    chroot "$ROOTFS" apt-get update
+
+    # libraspberrypi-bin contains kernel, firmware and some binary tools
+    chroot "$ROOTFS" apt-get install locales dbus openssh-server dosfstools libraspberrypi-bin
+
+    cat > "$ROOTFS"/boot/config.txt <<EOF
+gpu_mem=128
+start_file=start_x.elf
+fixup_file=fixup_x.dat
+EOF
+
+    # Set up network
+    if [ -n "$WPA_ESSID" ]; then
+	cat > "$ROOTFS"/etc/network/interfaces.d/wlan0 <<EOF
+auto wlan0
+iface wlan0 inet dhcp
+        wpa-essid "$WPA_ESSID"
+        wpa-psk "$WPA_PSK"
+EOF
+	chmod 660 "$ROOTFS"/etc/network/interfaces.d/wlan0
+	chroot "$ROOTFS" apt-get install firmware-realtek
+    else
+	cat > "$ROOTFS"/etc/network/interfaces.d/eth0 <<EOF
+auto eth0
+iface eth0 inet dhcp
+EOF
+    fi
+
+    # Set up file mounts
+    cat > "$ROOTFS"/etc/fstab <<EOF
+UUID=$(blkid -s UUID -o value "$PARTITION1") /boot vfat noatime   0 2
+UUID=$(blkid -s UUID -o value "$PARTITION2") /     ext4 noatime   0 1
+tmpfs                                        /tmp  tmpfs defaults 0 0
+EOF
+
+    # Set timezone
+    echo "$TIMEZONE" > "$ROOTFS"/etc/timezone
+    ln -sf /usr/share/zoneinfo/"$TIMEZONE" "$ROOTFS"/etc/localtime
+
+    # Set host configuration
+    echo "$HOSTNAME" > "$ROOTFS"/etc/hostname
+    sed -i "/^127.0.0.1/ s/\$/ $HOSTNAME/" "$ROOTFS"/etc/hosts
+    sed -i "/^::1/ s/\$/ $HOSTNAME/" > "$ROOTFS"/etc/hosts
+
+    # Login options
+    chroot "$ROOTFS" /bin/sh -c "echo root:$ROOT_PASSWORD | chpasswd"
+
+    if [ -e "$SSH_KEY" ]; then
+	mkdir "$ROOTFS"/root/.ssh
+	chmod 600 "$ROOTFS"/root/.ssh
+	cat "$SSH_KEY" >> "$ROOTFS"/root/.ssh/authorized_keys
+	chmod 600 "$ROOTFS"/root/.ssh/authorized_keys
+	sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/g' "$ROOTFS"/etc/ssh/sshd_config
+	echo "Success: SSH password login was disabled! Use the key in $SSH_KEY to login." 1>&2
+    else
+	sed -i 's/PermitRootLogin without-password/PermitRootLogin yes/g' "$ROOTFS"/etc/ssh/sshd_config
+	echo "Warning: no SSH key found, SSH password login has been enabled for root! Please enable key-login only as soon as possible." 1>&2
+    fi
+}
+
+umountrootfs() {
+    rm -f "$ROOTFS"/usr/bin/qemu-arm-static
+    umount "$ROOTFS"/boot
+    umount "$ROOTFS"
+    rm -r "$ROOTFS"
+}
+
+
+if [ "$FORCE" != 1 ]; then
+    echo "WARNING: The following operations may have destructive consequences." 1>&2
+    echo "Partition device $DEVICE and create bootable root file system on $ROOTFS" 1>&2
+    read -p "Continue? [Y,n] " yn
+    if [ "$yn" != "Y" ] && [ "$yn" != "y" ]; then
+	echo "Aborting." 1>&2
+	exit 1
+    fi
+fi
+
+partition && mountrootfs && mkrootfs && umountrootfs
